@@ -8,6 +8,7 @@
 #ifndef BAM_QC_computeCoverage_h
 #define BAM_QC_computeCoverage_h
 
+
 struct ChrStruct{
     int *positionmap; // map->first : base position, map->second : how many times it is covered
     string chrname;
@@ -17,18 +18,193 @@ class CoverageClass{
     friend class ReadStats;
 public:
     boost::unordered::unordered_map<int, string> chrmap;
+    vector< ChrStruct > CoverageperChr; // Each element keeps the coverage count of each base per chromosome
+    
+    void Initialise(string, ReadStats&, BamReader&);
+    void PickAlignments(string, ReadStats&);
     void ComputeCoverage(string, ReadStats&);
-private:
-    void AllocateMemorytoCoverageVectors(vector<ChrStruct>&, int, int,string);
+    void CalculateCoverage(void);
+    
+    void AllocateMemorytoCoverageVectors(int, int,string);
+    
     bool fillcoveragevector_span(BamAlignment, vector<ChrStruct>&);  //span, double count overlapping reads, counting_overlapping_bases_once count overlapping reads (base coverage)
-    bool fillcoveragevector_countonce_overlappingbases(BamAlignment, vector<ChrStruct>&);  //span, double count overlapping reads, counting_overlapping_bases_once countoverlapping reads (base coverage)
+    bool fillcoveragevector(BamAlignment);  //span, double count overlapping reads, counting_overlapping_bases_once countoverlapping reads (base coverage)
     bool fillcoveragevector_counttwice_overlappingbases(BamAlignment, vector<ChrStruct>&);  //span, double count overlapping reads, counting_overlapping_bases_once count overlapping reads (base coverage)
-
     void GenerateHistogram_perChr(string, int*, int,string);
-    void GenerateHistogram_Global(string, string, vector<ChrStruct>);
+    void GenerateHistogram_Global(string, string);
 };
 
-void CoverageClass::AllocateMemorytoCoverageVectors(vector<ChrStruct> & CoverageperChr, int key, int RefLength,string RefName){
+typedef struct{
+    string bamfilename;
+    ReadStats stats;
+}params;
+
+bool addtoPool(BamAlignment al, vector<BamAlignment>& buffer){
+        //Acquire lock
+    int poolSize = 0;
+    
+    if(die)
+        return false;
+    
+    if (pthread_mutex_trylock(&poolMutex) != 0) {//Mutex held by someone else
+        if (buffer.size() > 50) {//Don't buffer more than 100 sequences
+            pthread_mutex_lock(&poolMutex);
+            if (die)
+                return false;
+            //Drop entire buffer to pool
+            for (int i = 0; i < (int)buffer.size(); ++i) {
+                pool.push_back(buffer[i]);
+            }
+            poolSize = pool.size();
+            pthread_mutex_unlock(&poolMutex);
+            buffer.clear();
+        }
+        else
+            buffer.push_back(al);
+    }
+   else {
+
+    if (die)
+            return false;
+        //Do stuff
+        pool.push_back(al);
+        poolSize = pool.size();
+        pthread_mutex_unlock(&poolMutex);
+    }
+    //Is the pool completely full?
+    if (poolSize > 5000) {//Sleep around for some time... (:P)
+        do {
+#ifdef __linux__
+            pthread_yield();
+            usleep(1000);
+#endif
+        }while (pool.size() != 0);
+    }
+    return true;
+}
+
+void *filterAlignments(void *args){
+    params *p = (params*)args;
+    BamAlignment al;
+    BamReader reader;
+    
+    cout << p->bamfilename << endl;
+    if ( !reader.Open(p->bamfilename.c_str()) )
+        cerr << "Could not open input BAM file." << endl;
+    cout << p->bamfilename << "  opened" << endl;
+    
+    p->stats.NumberofPairs = 0;
+    p->stats.NumofMappedReads = 0;
+    p->stats.NumofDuplicates = 0;
+    p->stats.max_insert_size = 1000;
+    
+    vector< BamAlignment > buffer;
+    bool openfile = false;
+    do{
+        openfile = reader.GetNextAlignmentCore(al);
+        if (!openfile)
+            die = true;
+        ++(p->stats.NumberofPairs);
+        if(!al.IsDuplicate()){ // Do not count if it is a duplicate !!
+            if (al.MapQuality > 0 ) { // Do not count if it is not mapped
+                ++(p->stats.NumofMappedReads);
+                if (al.RefID == al.MateRefID) // Do not count if they are on different chromosomes !!
+                    p->stats.InsertSizes.push_back(al.InsertSize);
+                addtoPool(al,buffer);
+            }
+        }
+        else{
+            ++(p->stats.NumofDuplicates);
+        }
+        if(p->stats.NumberofPairs % 10000000 == 0)
+            cout << p->stats.NumberofPairs << " are processed" << endl;
+    }while(openfile);
+    
+    die = true;
+    cout << "BAM file finished" << endl;
+    
+    p->stats.PrintStats(p->bamfilename);
+    p->stats.PrintInsertSizes(p->bamfilename);
+    return NULL;
+}
+void CoverageClass::Initialise(string bamfilename, ReadStats& stats,BamReader& reader){
+    
+    int number_of_bins = (int) ceil(stats.max_mapq / stats.mapq_bin_size);
+    stats.mapq_histogram.resize(number_of_bins);
+    
+    cout << bamfilename << endl;
+    if ( !reader.Open(bamfilename.c_str()) )
+        cerr << "Could not open input BAM file." << endl;
+    cout << bamfilename << "  opened" << endl;
+
+    
+    const RefVector bam_ref_data = reader.GetReferenceData();
+    // Make a map of chr names to RefIDs
+    RefVector::const_iterator chrit;
+    
+    CoverageperChr.resize(bam_ref_data.size()); // Create one for each chromosome
+
+    for (chrit = bam_ref_data.begin(); chrit != bam_ref_data.end(); ++chrit){
+        int key = reader.GetReferenceID(chrit->RefName);
+        chrmap[key] = chrit->RefName;
+        //       cout << chrit->RefName << '\t' << chrit->RefLength << '\t' << key << '\t' << chrmap[key] << endl;
+        AllocateMemorytoCoverageVectors(key, chrit->RefLength, chrit->RefName);
+    }
+    reader.Close();
+}
+
+void CoverageClass::PickAlignments(string bamfilename, ReadStats& stats){
+    //Start threads!
+    pthread_attr_t attr;
+    /* Initialize and set thread detached attribute */
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    pthread_t someThread;
+    //Create the world!
+    params* p = new params;
+    p->bamfilename = bamfilename;
+    int rc = pthread_create(&someThread, &attr, &filterAlignments, p);
+    if (rc != 0) {//Thread creation failed!
+        fprintf(stderr,"Unable to create thread. Error code %d returned\n",rc);
+    }
+    
+}
+void CoverageClass::CalculateCoverage(void){
+    vector< BamAlignment > sequenceVector;
+    
+    do{
+        //Wait for pool!
+        pthread_mutex_lock(&poolMutex);
+        //Check for size of pool
+        if (pool.size() >= 50) {
+            for (int i = 0; i < pool.size() ; ++i) {
+                sequenceVector.push_back(pool[i]);
+            }
+            pool.clear();
+        }
+        pthread_mutex_unlock(&poolMutex);
+        if (sequenceVector.empty()) {
+            if(die)
+                break;
+            //Do something silly for some time
+            clock_t goal = 500 + clock();
+            while (goal > clock());
+            continue;
+        }
+        
+        int i = 0;
+        
+        while (i < sequenceVector.size()) {
+            fillcoveragevector(sequenceVector[i]);
+            ++i;
+        }
+        sequenceVector.clear();
+    }while(true);
+
+
+}
+
+void CoverageClass::AllocateMemorytoCoverageVectors(int key, int RefLength,string RefName){
     
     CoverageperChr[key].positionmap = (int*) realloc(CoverageperChr[key].positionmap, (RefLength + 1)*sizeof(int));
     if (CoverageperChr[key].positionmap == NULL)
@@ -54,7 +230,7 @@ bool CoverageClass::fillcoveragevector_span(BamTools::BamAlignment al, vector<Ch
     }
     return 0;
 }
-bool CoverageClass::fillcoveragevector_countonce_overlappingbases(BamAlignment al, vector<ChrStruct>& CoverageperChr){
+bool CoverageClass::fillcoveragevector(BamAlignment al){
 
     if (al.Position < al.MatePosition) { // Reads do not overlap, increase coverage for the bases covered by this alignment
         for (int i = al.Position; i < al.Position + al.Length; ++i)
@@ -88,7 +264,6 @@ void CoverageClass::ComputeCoverage(string bamfilename, ReadStats& stats){
     BamReader reader;
     cout << bamfilename << endl;
     
-    
     int number_of_bins = (int) ceil(stats.max_mapq / stats.mapq_bin_size);
     stats.mapq_histogram.resize(number_of_bins);
     
@@ -102,8 +277,6 @@ void CoverageClass::ComputeCoverage(string bamfilename, ReadStats& stats){
     // Make a map of chr names to RefIDs
     RefVector::const_iterator chrit;
     
-    
-    
     CoverageperChr_span.resize(bam_ref_data.size()); // Create one for each chromosome
     CoverageperChr_nooverlapcount.resize(bam_ref_data.size()); // Create one for each chromosome
     CoverageperChr_overlapcount.resize(bam_ref_data.size()); // Create one for each chromosome
@@ -112,9 +285,9 @@ void CoverageClass::ComputeCoverage(string bamfilename, ReadStats& stats){
         int key = reader.GetReferenceID(chrit->RefName);
         chrmap[key] = chrit->RefName;
  //       cout << chrit->RefName << '\t' << chrit->RefLength << '\t' << key << '\t' << chrmap[key] << endl;
-        AllocateMemorytoCoverageVectors(CoverageperChr_span,key, chrit->RefLength, chrit->RefName);
-        AllocateMemorytoCoverageVectors(CoverageperChr_nooverlapcount,key, chrit->RefLength, chrit->RefName);
-        AllocateMemorytoCoverageVectors(CoverageperChr_overlapcount,key, chrit->RefLength, chrit->RefName);
+        AllocateMemorytoCoverageVectors(key, chrit->RefLength, chrit->RefName);
+        AllocateMemorytoCoverageVectors(key, chrit->RefLength, chrit->RefName);
+ //       AllocateMemorytoCoverageVectors(CoverageperChr_overlapcount,key, chrit->RefLength, chrit->RefName);
     }
 
     BamAlignment al;
@@ -123,32 +296,33 @@ void CoverageClass::ComputeCoverage(string bamfilename, ReadStats& stats){
     while(reader.GetNextAlignmentCore(al)){
         ++stats.NumberofPairs;
         if(!al.IsDuplicate()){ // Do not count if it is a duplicate !!
-            if (al.IsMapped() && al.IsMateMapped()) { // if both mapped
-                if (al.MapQuality > 0 ) { // Do not count if mapping quality is zero !!
-                    ++stats.NumofUniqMappedPairs;
-                    fillcoveragevector_span(al,CoverageperChr_span);
-                    fillcoveragevector_countonce_overlappingbases(al, CoverageperChr_nooverlapcount);
-                    fillcoveragevector_counttwice_overlappingbases(al, CoverageperChr_overlapcount);
-                    if (al.RefID == al.MateRefID) { // Do not count if they are on different chromosomes !!
+            if (al.MapQuality > 0 ) { // Do not count if mapping quality is zero !!
+                ++stats.NumofUniqMappedPairs;
+            //    fillcoveragevector_span(al,CoverageperChr_span);
+            //    fillcoveragevector_countonce_overlappingbases(al, CoverageperChr_nooverlapcount);
+            //    fillcoveragevector_counttwice_overlappingbases(al, CoverageperChr_overlapcount);
+                if (al.RefID == al.MateRefID) { // Do not count if they are on different chromosomes !!
 //                        if (al.IsProperPair()) { // Do not count if they are not in valid orientation or invalid insert size, This put hard boundries in the insert size that are too restrictive so it is not used for now.
-                        ++stats.NumofProperPairs;
-                        stats.InsertSizes.push_back(al.InsertSize);
-                        int bucket = (int)floor(al.MapQuality / stats.mapq_bin_size);
-                        if (bucket >= stats.mapq_histogram.size())
-                            stats.mapq_histogram.resize(bucket+1,0);
-                        stats.mapq_histogram[bucket] += 1;
-                    }
+                    ++stats.NumofProperPairs;
+                    stats.InsertSizes.push_back(al.InsertSize);
+                    int bucket = (int)floor(al.MapQuality / stats.mapq_bin_size);
+                    if (bucket >= stats.mapq_histogram.size())
+                        stats.mapq_histogram.resize(bucket+1,0);
+                    stats.mapq_histogram[bucket] += 1;
                 }
             }
             else{
                 if(!al.IsMapped())
                     ++stats.NumofUnmappedReads;
-                if (!al.IsMateMapped())
+                if(!al.IsMateMapped())
                     ++stats.NumofUnmappedReads;
             }
         }
         else{
             ++stats.NumofDuplicates;
+        }
+        if (stats.NumberofPairs % 1000 == 0) {
+            cout << stats.NumberofPairs << "  are processed" << endl;
         }
     }
 //Counts for each base are generated, now coverage histograms will be generated
@@ -161,9 +335,9 @@ void CoverageClass::ComputeCoverage(string bamfilename, ReadStats& stats){
     }
 */
     //Generate overal coverage histogram
-    GenerateHistogram_Global(bamfilename,"Span", CoverageperChr_span);
-    GenerateHistogram_Global(bamfilename,"Base_w_ReadOverlap_Count", CoverageperChr_nooverlapcount);
-    GenerateHistogram_Global(bamfilename,"Base_wo_ReadOverlap_Count", CoverageperChr_overlapcount);
+//    GenerateHistogram_Global(bamfilename,"Span");
+  //  GenerateHistogram_Global(bamfilename,"Base_w_ReadOverlap_Count");
+   // GenerateHistogram_Global(bamfilename,"Base_wo_ReadOverlap_Count");
     
     cout << "Global Coverage Histograms Generated" << endl;
     
@@ -199,9 +373,8 @@ void CoverageClass::GenerateHistogram_perChr(string bamfilename, int *coverage, 
     }
  
 }
-void CoverageClass::GenerateHistogram_Global(string bamfilename, string coveragetype, vector<ChrStruct> CoverageperChr){
-    
-    
+void CoverageClass::GenerateHistogram_Global(string bamfilename, string coveragetype){
+
     int size_of_bins = 1;
     int number_of_bins = (int) ceil(max_coverage / size_of_bins);
     vector <long unsigned int> histogram(number_of_bins);
@@ -240,6 +413,6 @@ void CoverageClass::GenerateHistogram_Global(string bamfilename, string coverage
         coverage += histogram[i];
         outf << i*size_of_bins << '\t' << double (coverage/sum)*100 << endl;
     }
+ 
 }
-
 #endif

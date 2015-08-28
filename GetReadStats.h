@@ -66,9 +66,9 @@ void ReadStats::PrintStats(string bamfilename){
     ofstream ofile(bam_out.c_str());
     ofstream mapqfile(mapq_out.c_str());
     
-    ofile << "Number of Pairs" << '\t' << "Number of Proper Pairs" << '\t' << "Number of Uniquely Mapped Pairs (mapq > 0)" << '\t' << "Number of Unmapped Reads" << '\t'
+    ofile << "Number of Pairs" << '\t' << "Number of Uniquely Mapped Pairs (mapq > 0)" << '\t'
           << "Percentage of Uniquely Mapped Pairs" << '\t' << "Number of Duplicates" << '\t' << "Percentage of Duplicates" << endl;
-    ofile << NumberofPairs << '\t' << NumofProperPairs << '\t' << NumofUniqMappedPairs << '\t' << (NumofUnmappedReads) << '\t' << double(NumofUnmappedReads)/double(NumberofPairs*2.0)*100.0
+    ofile << NumberofPairs << '\t' << NumofMappedReads << '\t' << double(NumofMappedReads)/double(NumberofPairs)*100.0
           << '\t' << NumofDuplicates << '\t'<< double(NumofDuplicates)/double(NumberofPairs)*100.0 << endl;
     
     cout << "Mapping stats printed" << endl;
@@ -88,12 +88,14 @@ void ReadStats::PrintInsertSizes(string bamfilename){
     double median = 0;
     samplemedian(AX,median);
     
-    
     int size_of_bins = 1;
     int number_of_bins = (int) ceil(max_insert_size / size_of_bins);
+	cout << "Num of bins "  << number_of_bins << "  " << max_insert_size << "  " << size_of_bins << endl; 
     vector <long unsigned int> histogram(number_of_bins);
     for (int i = 0; i < number_of_bins; ++i)
         histogram[i] = 0;
+
+	cout << "here 0"  << endl;     
     
     for(int i = 0; i < InsertSizes.size(); ++i){
         int bucket = (int)floor(InsertSizes[i] / size_of_bins);
@@ -117,7 +119,7 @@ void ReadStats::PrintInsertSizes(string bamfilename){
     ofstream outfile(temp2.c_str());
     
     outfile << "Number of pairs processed" << '\t' << "MEAN" << '\t' << "VARIANCE" << '\t' << "SKEW" << '\t' << "KURTOSIS" << '\t' << "MEDIAN" << endl;
-    outfile << NumofProperPairs << '\t' << mean << '\t' << variance << '\t' << skew << '\t' << kurtosis << '\t' << median << endl;
+    outfile << NumberofPairs << '\t' << mean << '\t' << variance << '\t' << skew << '\t' << kurtosis << '\t' << median << endl;
     
     cout << "Insert size stats are printed" << endl;
     

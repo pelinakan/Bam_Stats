@@ -42,10 +42,19 @@ using namespace alglib_impl;
 #include "api/BamWriter.h"
 using namespace BamTools;
 
+const int N_THREADS = 15;
+#include <pthread.h>
+
+pthread_mutex_t poolMutex;
+std::vector< BamTools::BamAlignment > pool;
+bool die = false;
+
+
 const int max_coverage = 60;
 
 #include "GetReadStats.h"
 #include "computeCoverage.h"
+#include "thread_functions.h"
 
 #include "radix.h"
 #include "sam.h"
@@ -57,41 +66,53 @@ const int max_coverage = 60;
 #include <RNG.hpp>
 #include <smithlab_os.hpp>
 
+
 #include "preseq.cpp"
 
 #include "print_usage.h"
 
 int main(int argc, const char * argv[]) {
 //int main(void){
-    
+
     if (argc < 2) {
         print_usage();
         return -1;
     }
+ 
     ReadStats stats; //Class that keeps the read stats
     stats.InitialiseClass();
     
 	string bamfilename="";
-    //bamfilename = "/Users/pelinakan/Documents/WORK/GA_PROJECTS/BAM_QC/BAM_QC/test22.bam";
+//    bamfilename = "/Users/pelinakan/Documents/WORK/GA_PROJECTS/BAM_QC/BAM_QC/test22.bam";
 	bamfilename = argv[1];
     
+    BamReader reader;
+    CoverageClass cov;
     
-
-//    CoverageClass coverage_double;
-//    coverage_double.ComputeCoverage(bamfilename, "counting_overlapping_bases_twice", stats);
-    CoverageClass coverage_span;
-    coverage_span.ComputeCoverage(bamfilename, stats);
-//    CoverageClass coverage_single;
-//    coverage_single.ComputeCoverage(bamfilename, "counting_overlapping_bases_once", stats);
+    
+    cov.Initialise(bamfilename, stats, reader);
+    
+    // Initialise a mutex thread
+    pthread_mutex_init(&poolMutex,NULL);
+    //Startup generating threads!
+    cov.PickAlignments(bamfilename, stats);
+    cov.CalculateCoverage();
+    
+    pthread_mutex_lock(&poolMutex);
+    pool.clear();
+    pthread_mutex_unlock(&poolMutex);
+    
+    cov.GenerateHistogram_Global(bamfilename, "coverage");
+//    cov.ComputeCoverage(bamfilename, stats);
     
     cout << "Coverages Generated, Printing read and insert size stats... "<< endl;
-    
-    stats.PrintStats(bamfilename);
-    stats.PrintInsertSizes(bamfilename);
+
+    //stats.PrintStats(bamfilename);
+    //stats.PrintInsertSizes(bamfilename);
     
     cout << "BAM_QC completed on " << bamfilename << endl;
     
-    lc_extrap("yield.out", bamfilename);
+//    lc_extrap("yield.out", bamfilename);
     
     return 0;
 	
